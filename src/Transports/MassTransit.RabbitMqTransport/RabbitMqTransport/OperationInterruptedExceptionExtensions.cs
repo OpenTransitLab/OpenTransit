@@ -8,9 +8,9 @@ namespace MassTransit.RabbitMqTransport
         public static bool ChannelShouldBeClosed(this OperationInterruptedException ex)
         {
             if (ex.ShutdownReason == null)
-                return false;
+                return true;
 
-            return ex.ShutdownReason?.ReplyCode >= 400;
+            return ex.ShutdownReason?.ReplyCode >= 300;
         }
     }
 }

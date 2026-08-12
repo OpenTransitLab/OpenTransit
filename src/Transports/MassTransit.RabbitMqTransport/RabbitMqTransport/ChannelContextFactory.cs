@@ -1,93 +1,100 @@
-﻿namespace MassTransit.RabbitMqTransport
+﻿namespace MassTransit.RabbitMqTransport;
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Agents;
+using Internals;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
+
+
+public class ChannelContextFactory :
+    IPipeContextFactory<ChannelContext>
 {
-    using System;
-    using System.Threading;
-    using System.Threading.Tasks;
-    using Agents;
-    using Internals;
-    using RabbitMQ.Client.Events;
+    readonly ushort? _concurrentMessageLimit;
+    readonly IConnectionContextSupervisor _supervisor;
 
-
-    public class ChannelContextFactory :
-        IPipeContextFactory<ChannelContext>
+    public ChannelContextFactory(IConnectionContextSupervisor supervisor, ushort? concurrentMessageLimit)
     {
-        readonly ushort? _concurrentMessageLimit;
-        readonly IConnectionContextSupervisor _supervisor;
+        _supervisor = supervisor;
+        _concurrentMessageLimit = concurrentMessageLimit;
+    }
 
-        public ChannelContextFactory(IConnectionContextSupervisor supervisor, ushort? concurrentMessageLimit)
+    public IPipeContextAgent<ChannelContext> CreateContext(ISupervisor supervisor)
+    {
+        IAsyncPipeContextAgent<ChannelContext> asyncContext = supervisor.AddAsyncContext<ChannelContext>();
+
+        Task<ChannelContext> context = CreateChannel(asyncContext, supervisor.Stopped);
+
+        Task HandleShutdown(object sender, ShutdownEventArgs args)
         {
-            _supervisor = supervisor;
-            _concurrentMessageLimit = concurrentMessageLimit;
+            Task.Run(() => asyncContext.Stop(args.ReplyText))
+                .IgnoreUnobservedExceptions();
+
+            return Task.CompletedTask;
         }
 
-        public IPipeContextAgent<ChannelContext> CreateContext(ISupervisor supervisor)
+        context.ContinueWith(task =>
         {
-            IAsyncPipeContextAgent<ChannelContext> asyncContext = supervisor.AddAsyncContext<ChannelContext>();
+            var channelContext = task.Result;
 
-            Task<ChannelContext> context = CreateChannel(asyncContext, supervisor.Stopped);
+            channelContext.Channel.ChannelShutdownAsync += HandleShutdown;
+            channelContext.ConnectionContext.Connection.ConnectionShutdownAsync += HandleShutdown;
 
-            Task HandleShutdown(object sender, ShutdownEventArgs args)
+            void RemoveHandlers()
             {
-                Task.Run(() => asyncContext.Stop(args.ReplyText))
-                    .IgnoreUnobservedExceptions();
-
-                return Task.CompletedTask;
-            }
-
-            context.ContinueWith(task =>
-            {
-                var channelContext = task.Result;
-
-                channelContext.Channel.ChannelShutdownAsync += HandleShutdown;
-                channelContext.ConnectionContext.Connection.ConnectionShutdownAsync += HandleShutdown;
-
-                void RemoveHandlers()
+                try
                 {
-                    try
-                    {
-                        channelContext.ConnectionContext.Connection.ConnectionShutdownAsync -= HandleShutdown;
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                    }
-
-                    try
-                    {
-                        channelContext.Channel.ChannelShutdownAsync -= HandleShutdown;
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                    }
+                    channelContext.ConnectionContext.Connection.ConnectionShutdownAsync -= HandleShutdown;
+                }
+                catch (ObjectDisposedException)
+                {
                 }
 
-                asyncContext.Completed.ContinueWith(_ => RemoveHandlers());
-            }, TaskContinuationOptions.OnlyOnRanToCompletion);
-
-            return asyncContext;
-        }
-
-        public IActivePipeContextAgent<ChannelContext> CreateActiveContext(ISupervisor supervisor, PipeContextHandle<ChannelContext> context,
-            CancellationToken cancellationToken)
-        {
-            return supervisor.AddActiveContext(context, CreateSharedChannel(context.Context, cancellationToken));
-        }
-
-        static async Task<ChannelContext> CreateSharedChannel(Task<ChannelContext> context, CancellationToken cancellationToken)
-        {
-            return context.Status == TaskStatus.RanToCompletion
-                ? new ScopeChannelContext(context.Result, cancellationToken)
-                : new ScopeChannelContext(await context.OrCanceled(cancellationToken).ConfigureAwait(false), cancellationToken);
-        }
-
-        Task<ChannelContext> CreateChannel(IAsyncPipeContextAgent<ChannelContext> asyncContext, CancellationToken cancellationToken)
-        {
-            Task<ChannelContext> CreateChannelContext(ConnectionContext connectionContext, CancellationToken createCancellationToken,
-                ushort? concurrentMessageLimit)
-            {
-                return connectionContext.CreateChannelContext(asyncContext, concurrentMessageLimit, createCancellationToken);
+                try
+                {
+                    channelContext.Channel.ChannelShutdownAsync -= HandleShutdown;
+                }
+                catch (ObjectDisposedException)
+                {
+                }
             }
 
-            return _supervisor.CreateAgent(asyncContext, (context, token) => CreateChannelContext(context, token, _concurrentMessageLimit), cancellationToken);
+            asyncContext.Completed.ContinueWith(_ => RemoveHandlers());
+        }, TaskContinuationOptions.OnlyOnRanToCompletion);
+
+        return asyncContext;
+    }
+
+    public IActivePipeContextAgent<ChannelContext> CreateActiveContext(ISupervisor supervisor, PipeContextHandle<ChannelContext> context,
+        CancellationToken cancellationToken)
+    {
+        return supervisor.AddActiveContext(context, CreateSharedChannel(context.Context, cancellationToken));
+    }
+
+    static async Task<ChannelContext> CreateSharedChannel(Task<ChannelContext> contextTask, CancellationToken cancellationToken)
+    {
+        var context = contextTask.Status == TaskStatus.RanToCompletion
+            ? contextTask.Result
+            : await contextTask.OrCanceled(cancellationToken).ConfigureAwait(false);
+
+        if (context.Channel.IsClosed)
+            throw new OperationInterruptedException(
+                new ShutdownEventArgs(ShutdownInitiator.Peer, 491, $"Channel is already closed: {context.Channel.CloseReason}"));
+
+        return new ScopeChannelContext(context, cancellationToken);
+    }
+
+    Task<ChannelContext> CreateChannel(IAsyncPipeContextAgent<ChannelContext> asyncContext, CancellationToken cancellationToken)
+    {
+        Task<ChannelContext> CreateChannelContext(ConnectionContext connectionContext, CancellationToken createCancellationToken,
+            ushort? concurrentMessageLimit)
+        {
+            return connectionContext.CreateChannelContext(asyncContext, concurrentMessageLimit, createCancellationToken);
         }
+
+        return _supervisor.CreateAgent(asyncContext, (context, token) => CreateChannelContext(context, token, _concurrentMessageLimit), cancellationToken);
     }
 }

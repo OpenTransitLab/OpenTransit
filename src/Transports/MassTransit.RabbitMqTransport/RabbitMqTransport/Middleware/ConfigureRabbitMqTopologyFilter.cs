@@ -4,6 +4,9 @@ using System;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 using Topology;
 
 
@@ -58,13 +61,23 @@ public class ConfigureRabbitMqTopologyFilter<TSettings> :
 
     async Task ConfigureTopology(ChannelContext context, CancellationToken cancellationToken)
     {
-        await Task.WhenAll(_brokerTopology.Queues.Select(queue => Declare(context, queue, cancellationToken))).ConfigureAwait(false);
+        try
+        {
+            await Task.WhenAll(_brokerTopology.Queues.Select(queue => Declare(context, queue, cancellationToken))).ConfigureAwait(false);
 
-        await Task.WhenAll(_brokerTopology.Exchanges.Select(exchange => Declare(context, exchange, cancellationToken))).ConfigureAwait(false);
+            await Task.WhenAll(_brokerTopology.Exchanges.Select(exchange => Declare(context, exchange, cancellationToken))).ConfigureAwait(false);
 
-        await Task.WhenAll(_brokerTopology.QueueBindings.Select(binding => Bind(context, binding, cancellationToken))).ConfigureAwait(false);
+            await Task.WhenAll(_brokerTopology.QueueBindings.Select(binding => Bind(context, binding, cancellationToken))).ConfigureAwait(false);
 
-        await Task.WhenAll(_brokerTopology.ExchangeBindings.Select(binding => Bind(context, binding, cancellationToken))).ConfigureAwait(false);
+            await Task.WhenAll(_brokerTopology.ExchangeBindings.Select(binding => Bind(context, binding, cancellationToken))).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            await context.Channel.Cleanup(491, "ObjectDisposedException on channel", cancellationToken).ConfigureAwait(false);
+
+            throw new OperationInterruptedException(
+                new ShutdownEventArgs(ShutdownInitiator.Peer, 491, "ObjectDisposedException on channel"));
+        }
     }
 
     static Task Declare(ChannelContext context, Exchange exchange, CancellationToken cancellationToken)
